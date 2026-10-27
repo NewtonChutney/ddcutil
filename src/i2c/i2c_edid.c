@@ -122,6 +122,10 @@ int  EDID_Read_Size                  = DEFAULT_EDID_READ_SIZE;
 
 
 static Status_Errno_DDC
+i2c_get_edid_bytes_using_single_ioctl(int fd, Buffer * rawedid, int edid_read_size);
+
+
+static Status_Errno_DDC
 i2c_get_edid_bytes_directly_using_ioctl(
    int                   fd,
    Buffer*               rawedid,
@@ -485,9 +489,9 @@ i2c_get_edid_bytes_using_i2c_layer(
  *
  *  Which reader performs the re-read does not matter, for the reason given in the
  *  remark below: the recovery relies on the wrap, not on the word offset write
- *  taking effect.  It formerly used i2c_get_edid_bytes_using_single_ioctl(), which
- *  is now parked behind EDID_READ_SINGLE_IOCTL and would make this recovery
- *  unbuildable on its own, so it reads through the i2c layer instead.
+ *  taking effect.  It reads through the i2c layer; if the wrap repair fails, the
+ *  caller can still try i2c_get_edid_bytes_using_single_ioctl() to make the
+ *  offset write take effect.
  *
  *  @param  fd             file descriptor for open /dev/i2c-n
  *  @param  rawedid        buffer in which to return bytes of the EDID
@@ -567,6 +571,7 @@ i2c_get_raw_edid_by_fd(int fd, Buffer * rawedid, Optional_True_False * x30_respo
    I2C_IO_Strategy_Id cur_strategy_id = I2C_IO_STRATEGY_NOT_SET;
    cur_strategy_id = i2c_get_io_strategy_id();
    assert(cur_strategy_id != I2C_IO_STRATEGY_NOT_SET);
+   bool single_ioctl_tried = false;
 retry:
    DBGMSF(debug, "Using strategy  %s", i2c_io_strategy_id_name(cur_strategy_id) );
    int rc = -1;
@@ -726,6 +731,22 @@ retry:
                rc = 0;
             }
          }
+         if (rc == DDCRC_INVALID_EDID && !single_ioctl_tried) {
+            // Some adapters ignore a standalone offset write.  Retry with a
+            // repeated START before the read, but only after a successful
+            // transfer returned invalid data: combined reads can be very slow
+            // on empty buses.  Keep the normal retry ladder if this fails.
+            single_ioctl_tried = true;
+            DBGTRC_NOPREFIX(debug, TRACE_GROUP,
+                  "Invalid EDID after split read; trying combined offset write/read");
+            Status_Errno_DDC combined_rc =
+                  i2c_get_edid_bytes_using_single_ioctl(fd, rawedid, edid_read_size);
+            if (combined_rc == 0 && is_valid_raw_edid(rawedid->bytes, rawedid->len))
+               rc = 0;
+            DBGTRC_NOPREFIX(debug, TRACE_GROUP,
+                  "Combined EDID read returned %s, EDID %s",
+                  psc_desc(combined_rc), (rc == 0) ? "valid" : "invalid");
+         }
       }  // get bytes succeeded
       if (rc == -EBUSY) {
          DBGTRC_NOPREFIX(debug, TRACE_GROUP, "EDID read failed with -EBUSY.  Will retry after 100 ms.");
@@ -816,7 +837,9 @@ void init_i2c_edid() {
 
 
 #ifdef EDID_READ_SINGLE_IOCTL
-/* Retained for comparison testing only.  Must not be enabled in normal use.
+/* Historical notes on the retired unconditional single-ioctl path and its
+ * option plumbing.  The reader below is now used only as an invalid-data
+ * fallback, not on transfer errors or ahead of the normal split read.
  *
  * Why not: on some drivers the single ioctl read is very slow when there is no
  * EDID to read -- which is most of what display detection looks at, and the bus
@@ -904,11 +927,12 @@ bool read_edid_using_single_ioctl    = DEFAULT_SINGLE_IOCTL_EDID_READ;
 
 
 
-#ifdef EDID_READ_SINGLE_IOCTL
 /** Reads the EDID in a single I2C_RDWR ioctl.
  *
  *  Some monitors, e.g. Dell P2725DE ignore an offset write sent as a transaction
  *  of its own and return the wrong 128 byte block for the subsequent read.
+ *  Used only after a successful split transfer returns invalid EDID data,
+ *  since a combined transfer can time out slowly on an empty bus (see above).
  *
  * @param   fd             file descriptor for open /dev/i2c-n
  * @param   rawedid        buffer in which to return bytes of the EDID
@@ -919,7 +943,7 @@ bool read_edid_using_single_ioctl    = DEFAULT_SINGLE_IOCTL_EDID_READ;
  * From user przemech, based on function drm_do_probe_ddc_edid() in kernel source
  * file drivers/gpu/drm/drm_edid.c, which uses a single ioctl() to read the EDID.
  */
-Status_Errno_DDC
+static Status_Errno_DDC
 i2c_get_edid_bytes_using_single_ioctl(
    int     fd,
    Buffer* rawedid,
@@ -935,6 +959,11 @@ i2c_get_edid_bytes_using_single_ioctl(
 
    // messages needs to be allocated, cannot be on stack:
    struct i2c_msg * messages = calloc(2, sizeof(struct i2c_msg));
+   if (!messages) {
+      DBGTRC_RET_DDCRC(debug, TRACE_GROUP, -ENOMEM, "");
+      return -ENOMEM;
+   }
+   buffer_set_length(rawedid, 0);
    struct i2c_rdwr_ioctl_data  msgset;
    memset(&msgset,0,sizeof(msgset));  // see comment in i2c_get_edid_bytes_directly_using_ioctl()
 
@@ -966,9 +995,11 @@ i2c_get_edid_bytes_using_single_ioctl(
       }
       rc = -errsv;
    }
+   else if (rc != 2) {
+      DBGTRC_NOPREFIX(debug, TRACE_GROUP, "Incomplete I2C_RDWR: %d of 2 messages", rc);
+      rc = -EIO;
+   }
    else {
-      if (rc != 2)      // expected success value: number of messages executed
-         DBGMSG("Unexpected: ioctl() returned %d", rc);
       buffer_set_length(rawedid, edid_read_size);
       rc = 0;
    }
@@ -983,4 +1014,3 @@ i2c_get_edid_bytes_using_single_ioctl(
    DBGTRC_RET_DDCRC(debug, TRACE_GROUP, rc, "");
    return rc;
 }
-#endif
